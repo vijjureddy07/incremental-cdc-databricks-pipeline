@@ -17,6 +17,11 @@ DEFAULT_VALID_DIR = DEFAULT_OUTPUT_DIR / "valid_events"
 DEFAULT_QUARANTINE_DIR = DEFAULT_OUTPUT_DIR / "quarantine"
 DEFAULT_LATE_DIR = DEFAULT_OUTPUT_DIR / "late_events"
 DEFAULT_METRICS_DIR = DEFAULT_OUTPUT_DIR / "metrics"
+DEFAULT_DELTA_DIR = PROJECT_ROOT / "delta"
+DEFAULT_CURRENT_DIR = DEFAULT_DELTA_DIR / "current"
+DEFAULT_AUDIT_DIR = DEFAULT_DELTA_DIR / "audit"
+DEFAULT_APPLIED_EVENTS_DIR = DEFAULT_AUDIT_DIR / "applied_events"
+DEFAULT_BATCH_APPLY_METRICS_DIR = DEFAULT_AUDIT_DIR / "batch_apply_metrics"
 
 # Java Home auto-detection for macOS Homebrew OpenJDK 17
 DEFAULT_JAVA_HOME = "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"

@@ -20,6 +20,7 @@ from src.schemas.cdc_schema import (
     OPERATION_DELETE,
     PRIMARY_KEY_BY_TABLE,
     REQUIRED_FIELDS_BY_TABLE,
+    generate_event_id,
 )
 
 
@@ -80,7 +81,7 @@ def validate_event_row(
     if schema_version is None or schema_version <= 0:
         reasons.append(f"INVALID_SCHEMA_VERSION: {schema_version}")
 
-    # 9. payload validation
+    # 9. payload validation & primary key consistency (A5)
     if payload is None or len(payload.strip()) == 0:
         reasons.append("MISSING_PAYLOAD")
     else:
@@ -90,6 +91,14 @@ def validate_event_row(
                 reasons.append("PAYLOAD_NOT_A_JSON_OBJECT")
             elif source_table in ALLOWED_TABLES and operation in ALLOWED_OPERATIONS:
                 pk_field = PRIMARY_KEY_BY_TABLE[source_table]
+
+                # A5: Payload PK must equal envelope business_key
+                payload_pk = parsed_payload.get(pk_field)
+                if payload_pk is not None and str(payload_pk) != str(business_key):
+                    reasons.append(
+                        f"PAYLOAD_KEY_MISMATCH: payload.{pk_field} ('{payload_pk}') != business_key ('{business_key}')"
+                    )
+
                 if operation == OPERATION_DELETE:
                     # DELETE allows reduced tombstone payload with at least the business key or primary key
                     if (
@@ -105,6 +114,29 @@ def validate_event_row(
                         reasons.append(f"PAYLOAD_MISSING_REQUIRED_FIELDS: {missing}")
         except json.JSONDecodeError as exc:
             reasons.append(f"MALFORMED_JSON_PAYLOAD: {exc.msg}")
+
+    # 10. event_id integrity verification (A4)
+    # Only recompute when the component envelope fields are themselves valid
+    if (
+        event_id
+        and len(event_id) == 64
+        and source_table in ALLOWED_TABLES
+        and operation in ALLOWED_OPERATIONS
+        and business_key
+        and len(business_key.strip()) > 0
+        and source_sequence is not None
+        and source_sequence > 0
+    ):
+        expected_event_id = generate_event_id(
+            source_table=source_table,
+            business_key=business_key,
+            source_sequence=source_sequence,
+            operation=operation,
+        )
+        if event_id != expected_event_id:
+            reasons.append(
+                f"EVENT_ID_MISMATCH: supplied '{event_id}' != expected '{expected_event_id}'"
+            )
 
     if reasons:
         return False, "; ".join(reasons)

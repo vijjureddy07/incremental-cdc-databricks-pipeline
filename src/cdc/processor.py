@@ -269,12 +269,10 @@ class CDCProcessor:
                 f"Simulated pipeline processing failure triggered for batch {batch_id} before checkpoint commit!"
             )
 
-        # 6. ATOMIC CHECKPOINT ADVANCEMENT (ONLY ON COMPLETE SUCCESS)
-        for table, new_hwm in staged_checkpoint_updates.items():
-            self.checkpoint_mgr.advance_high_water_mark(
-                table=table,
-                sequence=new_hwm,
-                batch_id=batch_id,
-            )
+        # 6. ATOMIC BATCH CHECKPOINT ADVANCEMENT (ONLY ON COMPLETE SUCCESS)
+        self.checkpoint_mgr.commit_batch(
+            batch_id=batch_id,
+            table_sequences=staged_checkpoint_updates,
+        )
 
         return batch_result

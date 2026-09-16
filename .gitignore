@@ -77,6 +77,8 @@ data/sample/snapshot/
 !data/sample/.gitkeep
 output/
 !output/.gitkeep
+/delta/
+!/delta/.gitkeep
 state/checkpoints/
 !state/.gitkeep
 

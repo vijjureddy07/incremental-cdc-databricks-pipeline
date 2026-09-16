@@ -25,18 +25,50 @@ def deduplicate_cdc_events(df: DataFrame) -> Tuple[DataFrame, DataFrame]:
     physical record is retained when non-keyed columns differ. Using `ROW_NUMBER()` with an explicit
     `ORDER BY` clause provides strict, reproducible determinism.
 
+    STABLE TIE-BREAKER:
+    To guarantee 100% determinism even when duplicate event IDs share identical
+    `ingested_timestamp` and `source_sequence` but differ in metadata or payload, we compute
+    `canonical_event_hash` (SHA-256 over all envelope fields and payload) as the final tie-breaker.
+
     Returns:
         (deduped_df, duplicates_df)
     """
-    # Deterministic tie-breaking order: earliest ingestion timestamp, then lowest sequence
+    canonical_hash_expr = F.sha2(
+        F.concat_ws(
+            "||",
+            F.coalesce(F.col("event_id"), F.lit("")),
+            F.coalesce(F.col("source_table"), F.lit("")),
+            F.coalesce(F.col("operation"), F.lit("")),
+            F.coalesce(F.col("business_key"), F.lit("")),
+            F.coalesce(F.col("source_sequence").cast("string"), F.lit("")),
+            F.coalesce(F.col("event_timestamp"), F.lit("")),
+            F.coalesce(F.col("ingested_timestamp"), F.lit("")),
+            F.coalesce(F.col("batch_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("schema_version").cast("string"), F.lit("")),
+            F.coalesce(F.col("payload"), F.lit("")),
+        ),
+        256,
+    )
+
+    df_with_hash = df.withColumn("_canonical_event_hash", canonical_hash_expr)
+
+    # Deterministic tie-breaking order:
+    # 1. Earliest ingestion timestamp
+    # 2. Lowest source sequence
+    # 3. Stable canonical hash of complete envelope & payload
     window_spec = Window.partitionBy("event_id").orderBy(
         F.col("ingested_timestamp").asc_nulls_last(),
         F.col("source_sequence").asc(),
+        F.col("_canonical_event_hash").asc(),
     )
 
-    ranked_df = df.withColumn("_row_num", F.row_number().over(window_spec))
+    ranked_df = df_with_hash.withColumn("_row_num", F.row_number().over(window_spec))
 
-    deduped_df = ranked_df.filter(F.col("_row_num") == 1).drop("_row_num")
-    duplicates_df = ranked_df.filter(F.col("_row_num") > 1).drop("_row_num")
+    deduped_df = (
+        ranked_df.filter(F.col("_row_num") == 1).drop("_row_num").drop("_canonical_event_hash")
+    )
+    duplicates_df = (
+        ranked_df.filter(F.col("_row_num") > 1).drop("_row_num").drop("_canonical_event_hash")
+    )
 
     return deduped_df, duplicates_df

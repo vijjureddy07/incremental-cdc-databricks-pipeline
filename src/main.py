@@ -125,6 +125,93 @@ def cmd_run_all(args: argparse.Namespace) -> None:
     print("\n✓ Full workflow execution completed successfully.")
 
 
+def cmd_init_delta(args: argparse.Namespace) -> None:
+    print("Initializing Delta current-state tables from initial snapshot...")
+    from src.delta.current_state import initialize_delta_current_state
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        counts = initialize_delta_current_state(
+            spark=spark,
+            force_overwrite=args.force,
+        )
+        print("✓ Delta current-state tables initialized successfully:")
+        for table, cnt in counts.items():
+            print(f"  • {table}: {cnt} rows")
+    finally:
+        stop_spark_session()
+
+
+def cmd_apply_cdc(args: argparse.Namespace) -> None:
+    print("Executing Delta CDC Apply Pipeline...")
+    from src.pipelines.delta_cdc_apply import DeltaCDCApplier
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        applier = DeltaCDCApplier(spark=spark)
+        result = applier.run_apply_pipeline()
+
+        if not result.batches_processed:
+            print("✓ No new pending CDC batches. Delta current-state tables are up to date.")
+            return
+
+        print(f"✓ Successfully applied {len(result.batches_processed)} CDC batches to Delta Lake:")
+        for b in result.batches_processed:
+            print(f"  • Batch {b.batch_id}:")
+            print(f"    - Valid unique events: {b.total_valid_unique_events}")
+            print(f"    - Applied Inserts: {b.total_applied_inserts}")
+            print(f"    - Applied Updates: {b.total_applied_updates}")
+            print(f"    - Applied Deletes (Tombstones): {b.total_applied_deletes}")
+            print(f"    - In-Batch Superseded Events: {b.total_superseded_events}")
+            print(f"    - Stale No-Ops (seq <= HWM): {b.total_stale_noops}")
+            print(f"    - Already Applied: {b.total_already_applied}")
+            print(f"    - Recovered after crash: {b.total_recovered_events}")
+
+        print("\n✓ Current Table High-Water Marks:")
+        for t, hwm in result.checkpoint_state.items():
+            print(f"  - {t}: sequence {hwm}")
+    finally:
+        stop_spark_session()
+
+
+def cmd_show_current(args: argparse.Namespace) -> None:
+    print(f"Querying Delta current-state table '{args.table}'...")
+    from src.delta.current_state import load_active_table, load_current_table
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        if args.active_only:
+            df = load_active_table(spark, args.table)
+            print(f"=== Active Records in '{args.table}' (Total: {df.count()}) ===")
+        else:
+            df = load_current_table(spark, args.table)
+            print(f"=== Physical Records in '{args.table}' (Total: {df.count()}) ===")
+        df.show(args.limit, truncate=False)
+    finally:
+        stop_spark_session()
+
+
+def cmd_show_applied_events(args: argparse.Namespace) -> None:
+    print("Querying Applied Event Ledger (delta/audit/applied_events)...")
+    from src.delta.audit import get_applied_events_path
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        p = get_applied_events_path()
+        if not p.exists():
+            print("No applied events ledger found.")
+            return
+        df = spark.read.format("delta").load(str(p))
+        print(f"=== Applied Event Ledger (Total Records: {df.count()}) ===")
+        df.orderBy(df["applied_at"].desc()).show(args.limit, truncate=False)
+    finally:
+        stop_spark_session()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Incremental CDC Databricks Pipeline CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -140,11 +227,44 @@ def main() -> None:
     p_cdc.add_argument("--scale", choices=["tiny", "small", "standard"], default="tiny")
     p_cdc.add_argument("--seed", type=int, default=42)
 
-    # process-cdc
-    subparsers.add_parser("process-cdc", help="Process pending CDC batches incrementally")
+    # process-cdc (Module 1 change-feed staging)
+    subparsers.add_parser(
+        "process-cdc", help="Process pending CDC batches into valid/quarantine/late"
+    )
 
-    # analyze-cdc
+    # analyze-cdc (Module 1 diagnostic views)
     subparsers.add_parser("analyze-cdc", help="Run Spark SQL diagnostics")
+
+    # init-delta (Module 2 snapshot -> Delta)
+    p_init_delta = subparsers.add_parser(
+        "init-delta", help="Initialize Delta current-state tables from snapshot"
+    )
+    p_init_delta.add_argument(
+        "--force", action="store_true", help="Force overwrite existing Delta tables"
+    )
+
+    # apply-cdc (Module 2 Delta MERGE apply)
+    subparsers.add_parser(
+        "apply-cdc", help="Apply CDC change feed into Delta current-state tables via MERGE"
+    )
+
+    # show-current (Module 2 inspect current state)
+    p_show = subparsers.add_parser("show-current", help="Display current-state Delta table")
+    p_show.add_argument(
+        "--table",
+        choices=["accounts", "subscriptions", "invoices", "payments"],
+        default="subscriptions",
+    )
+    p_show.add_argument("--limit", type=int, default=20)
+    p_show.add_argument(
+        "--active-only", action="store_true", help="Filter out soft-deleted tombstones"
+    )
+
+    # show-applied-events (Module 2 inspect ledger)
+    p_ledger = subparsers.add_parser(
+        "show-applied-events", help="Display applied events audit ledger"
+    )
+    p_ledger.add_argument("--limit", type=int, default=20)
 
     # run-all
     p_all = subparsers.add_parser("run-all", help="Run end-to-end pipeline")
@@ -159,6 +279,10 @@ def main() -> None:
         "generate-cdc": cmd_generate_cdc,
         "process-cdc": cmd_process_cdc,
         "analyze-cdc": cmd_analyze_cdc,
+        "init-delta": cmd_init_delta,
+        "apply-cdc": cmd_apply_cdc,
+        "show-current": cmd_show_current,
+        "show-applied-events": cmd_show_applied_events,
         "run-all": cmd_run_all,
     }
 
