@@ -50,6 +50,10 @@ credentials.json
 *.swo
 .DS_Store
 
+# Pytest and linter caches
+.pytest_cache/
+.ruff_cache/
+
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
@@ -62,11 +66,19 @@ credentials.json
 *.avro
 *.csv
 *.tsv
-*.jsonl
 *.delta
 _delta_log/
 checkpoint/
 _spark_metadata/
+
+# Generated runtime data and pipeline outputs
+data/generated/
+data/sample/snapshot/
+!data/sample/.gitkeep
+output/
+!output/.gitkeep
+state/checkpoints/
+!state/.gitkeep
 
 # Logs
 logs/
