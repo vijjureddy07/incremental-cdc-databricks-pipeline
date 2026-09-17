@@ -5,6 +5,7 @@ from typing import Dict, List
 from pyspark.sql.types import (
     BooleanType,
     DecimalType,
+    IntegerType,
     LongType,
     StringType,
     StructField,
@@ -19,6 +20,7 @@ LINEAGE_FIELD_NAMES: List[str] = [
     "_last_batch_id",
     "_updated_at",
     "_is_deleted",
+    "_last_schema_version",
 ]
 
 TARGET_LINEAGE_FIELDS: List[StructField] = [
@@ -28,6 +30,7 @@ TARGET_LINEAGE_FIELDS: List[StructField] = [
     StructField("_last_batch_id", LongType(), nullable=False),
     StructField("_updated_at", StringType(), nullable=False),
     StructField("_is_deleted", BooleanType(), nullable=False),
+    StructField("_last_schema_version", IntegerType(), nullable=True),
 ]
 
 # Business Schemas (Monetary values MUST use DecimalType(12, 2))

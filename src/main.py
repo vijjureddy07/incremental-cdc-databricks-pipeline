@@ -212,6 +212,133 @@ def cmd_show_applied_events(args: argparse.Namespace) -> None:
         stop_spark_session()
 
 
+def cmd_build_event_store(args: argparse.Namespace) -> None:
+    print("Building canonical CDC Event Store from generated batches...")
+    from src.events.event_store import backfill_event_store
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        count = backfill_event_store(spark)
+        print(f"✓ Backfilled canonical CDC event store. Total events processed: {count}")
+    finally:
+        stop_spark_session()
+
+
+def cmd_init_history(args: argparse.Namespace) -> None:
+    print("Initializing subscriptions_history SCD2 table from snapshot...")
+    from src.history.subscriptions_scd2 import initialize_subscriptions_history_from_snapshot
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        count = initialize_subscriptions_history_from_snapshot(spark, force_overwrite=args.force)
+        print(f"✓ Seeded subscriptions_history with {count} baseline versions.")
+    finally:
+        stop_spark_session()
+
+
+def cmd_detect_late_events(args: argparse.Namespace) -> None:
+    print("Scanning for late CDC events and enqueuing to late_event_queue...")
+    from pyspark.sql import functions as F
+
+    from src.config.settings import DEFAULT_CDC_EVENT_STORE_DIR
+    from src.delta.current_state import load_current_table
+    from src.replay.queue import enqueue_late_events
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        store_df = spark.read.format("delta").load(str(DEFAULT_CDC_EVENT_STORE_DIR))
+        sub_curr = load_current_table(spark, "subscriptions")
+
+        joined = (
+            store_df.filter(F.col("source_table") == "subscriptions")
+            .join(
+                sub_curr.select(
+                    F.col("subscription_id").alias("curr_sub_id"),
+                    F.col("_last_source_sequence").alias("curr_seq"),
+                ),
+                store_df.business_key == F.col("curr_sub_id"),
+                "inner",
+            )
+            .filter(F.col("source_sequence") < F.col("curr_seq"))
+        )
+
+        enqueued = enqueue_late_events(spark, joined)
+        print(f"✓ Detected and enqueued {enqueued} late events into replay queue.")
+    finally:
+        stop_spark_session()
+
+
+def cmd_replay_late_events(args: argparse.Namespace) -> None:
+    print("Processing pending late-event historical replays...")
+    from src.replay.processor import process_pending_replays
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        summary = process_pending_replays(spark, repair_current=args.repair_current)
+        print("✓ Replay execution summary:")
+        print(f"  - Total pending evaluated: {summary['total_pending']}")
+        print(f"  - Successfully applied: {summary['applied']}")
+        print(f"  - Conflicts detected: {summary['conflict']}")
+        print(f"  - Failures: {summary['failed']}")
+    finally:
+        stop_spark_session()
+
+
+def cmd_show_history(args: argparse.Namespace) -> None:
+    from pyspark.sql import functions as F
+
+    from src.config.settings import DEFAULT_SUBSCRIPTIONS_HISTORY_DIR
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        hist_df = spark.read.format("delta").load(str(DEFAULT_SUBSCRIPTIONS_HISTORY_DIR))
+        if args.subscription_id:
+            hist_df = hist_df.filter(F.col("subscription_id") == args.subscription_id)
+
+        hist_df = hist_df.orderBy(F.col("valid_from_sequence").asc())
+        print(f"\n=== Subscriptions SCD2 History ({args.subscription_id or 'All'}) ===")
+        hist_df.show(args.limit, truncate=False)
+    finally:
+        stop_spark_session()
+
+
+def cmd_show_replay_queue(args: argparse.Namespace) -> None:
+    from src.config.settings import DEFAULT_LATE_EVENT_QUEUE_DIR
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        queue_df = spark.read.format("delta").load(str(DEFAULT_LATE_EVENT_QUEUE_DIR))
+        print("\n=== Late Event Replay Queue ===")
+        queue_df.show(args.limit, truncate=False)
+    finally:
+        stop_spark_session()
+
+
+def cmd_migrate_schema(args: argparse.Namespace) -> None:
+    print(
+        f"Running controlled schema migration for table '{args.table}' to version {args.to_version}..."
+    )
+    from src.schema_evolution.migrations import migrate_subscriptions_to_v2
+    from src.utils.spark import get_spark_session, stop_spark_session
+
+    spark = get_spark_session()
+    try:
+        if args.table == "subscriptions" and args.to_version == 2:
+            res = migrate_subscriptions_to_v2(spark)
+            print(f"✓ Migration result: {res['status']} - {res['message']}")
+            print(f"  Columns: {res['columns']}")
+        else:
+            print(f"Error: Unsupported migration target {args.table} -> v{args.to_version}")
+    finally:
+        stop_spark_session()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Incremental CDC Databricks Pipeline CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -226,6 +353,12 @@ def main() -> None:
     p_cdc.add_argument("--batches", type=int, default=3)
     p_cdc.add_argument("--scale", choices=["tiny", "small", "standard"], default="tiny")
     p_cdc.add_argument("--seed", type=int, default=42)
+    p_cdc.add_argument(
+        "--schema-transition-batch",
+        type=int,
+        default=None,
+        help="Batch ID from which newly generated subscriptions use Schema V2",
+    )
 
     # process-cdc (Module 1 change-feed staging)
     subparsers.add_parser(
@@ -266,6 +399,49 @@ def main() -> None:
     )
     p_ledger.add_argument("--limit", type=int, default=20)
 
+    # Module 3 Commands:
+    # build-event-store
+    subparsers.add_parser("build-event-store", help="Build canonical CDC event store from batches")
+
+    # init-history
+    p_hist_init = subparsers.add_parser(
+        "init-history", help="Initialize subscriptions SCD2 history from snapshot"
+    )
+    p_hist_init.add_argument(
+        "--force", action="store_true", help="Force overwrite existing history"
+    )
+
+    # detect-late-events
+    subparsers.add_parser(
+        "detect-late-events", help="Detect late events and enqueue to replay queue"
+    )
+
+    # replay-late-events
+    p_replay = subparsers.add_parser(
+        "replay-late-events", help="Process pending late event replays"
+    )
+    p_replay.add_argument(
+        "--repair-current", action="store_true", help="Explicitly align current state on drift"
+    )
+
+    # show-history
+    p_show_hist = subparsers.add_parser("show-history", help="Display subscriptions SCD2 history")
+    p_show_hist.add_argument("--subscription-id", type=str, default=None)
+    p_show_hist.add_argument("--limit", type=int, default=20)
+
+    # show-replay-queue
+    p_show_queue = subparsers.add_parser(
+        "show-replay-queue", help="Display late event replay queue"
+    )
+    p_show_queue.add_argument("--limit", type=int, default=20)
+
+    # migrate-schema
+    p_mig = subparsers.add_parser(
+        "migrate-schema", help="Run controlled Delta table schema migration"
+    )
+    p_mig.add_argument("--table", choices=["subscriptions"], default="subscriptions")
+    p_mig.add_argument("--to-version", type=int, default=2)
+
     # run-all
     p_all = subparsers.add_parser("run-all", help="Run end-to-end pipeline")
     p_all.add_argument("--batches", type=int, default=3)
@@ -283,6 +459,13 @@ def main() -> None:
         "apply-cdc": cmd_apply_cdc,
         "show-current": cmd_show_current,
         "show-applied-events": cmd_show_applied_events,
+        "build-event-store": cmd_build_event_store,
+        "init-history": cmd_init_history,
+        "detect-late-events": cmd_detect_late_events,
+        "replay-late-events": cmd_replay_late_events,
+        "show-history": cmd_show_history,
+        "show-replay-queue": cmd_show_replay_queue,
+        "migrate-schema": cmd_migrate_schema,
         "run-all": cmd_run_all,
     }
 

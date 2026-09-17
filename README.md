@@ -15,35 +15,38 @@ A focused CDC portfolio implementation and local CDC processing pipeline built w
 Simulated OLTP
       │
       ▼
-CDC JSONL Change Feed
+CDC Batches
       │
       ▼
-  Validation
+Validation + Dedupe
       │
       ▼
-Deterministic Dedupe
+Canonical Event Store (delta/events/cdc_event_store)
       │
       ▼
-Sequence Ordering
+Normal CDC Apply
+      ├──────────────────────────────────────────────┐
+      ▼                                              ▼
+Current-State Delta Tables               Subscription SCD2 History
+(accounts, subscriptions, ...)           (delta/history/subscriptions_history)
+      ▲                                              ▲
+      │                                              │
+Late Event Detection                                 │
+      │                                              │
+      ▼                                              │
+Replay Queue (delta/replay/late_event_queue)         │
+      │                                              │
+      ▼                                              │
+Key-Scoped Replay ───────────────────────────────────┘
       │
       ▼
-Delta CDC Apply
-      │
-      ▼
-┌─────────────────────────────┐
-│ Current-State Delta Tables  │
-│ accounts                    │
-│ subscriptions               │
-│ invoices                    │
-│ payments                    │
-└─────────────────────────────┘
-      │
-      ▼
-Applied Event Ledger
-      │
-      ▼
-Atomic Batch Checkpoint
+Replay Audit (delta/replay/replay_audit)
 ```
+
+### Versioned Schema Registry
+* **Schema V1**: `subscription_id`, `account_id`, `plan`, `status`, `monthly_amount`, `renewal_date`
+* **Schema V2**: Adds `billing_cycle` (`MONTHLY`, `ANNUAL`) and `currency` (`USD`, `EUR`, `GBP`, `INR`)
+
 
 ---
 
@@ -115,7 +118,31 @@ python -m src.main show-current --table subscriptions
 python -m src.main show-applied-events
 ```
 
-### 3. Module 1 Diagnostic Commands
+### 3. Run Module 3 Late-Event Replay, SCD2 & Schema Evolution Workflow
+```bash
+# 1. Backfill canonical Delta event store from generated CDC batches
+python -m src.main build-event-store
+
+# 2. Initialize operational SCD2 subscription history from snapshot
+python -m src.main init-history --scale tiny
+
+# 3. Detect late-arriving events and stage to replay queue
+python -m src.main detect-late-events
+
+# 4. Replay late events with deterministic key-scoped historical rebuild
+python -m src.main replay-late-events
+
+# 5. Inspect subscription SCD2 history for a specific business key
+python -m src.main show-history --subscription-id SUB-000001
+
+# 6. View late-event replay queue status
+python -m src.main show-replay-queue
+
+# 7. Perform controlled schema migration to Subscription V2
+python -m src.main migrate-schema --table subscriptions --to-version 2
+```
+
+### 4. Module 1 Diagnostic Commands
 ```bash
 # Generate initial OLTP snapshot
 python -m src.main generate-snapshot --scale tiny --seed 42
@@ -130,7 +157,7 @@ python -m src.main process-cdc
 python -m src.main analyze-cdc
 ```
 
-### 4. Running the Test Suite
+### 5. Running the Test Suite
 ```bash
 pytest tests/ -v
 ruff check .
@@ -142,10 +169,12 @@ ruff check .
 
 | Module | Scope | Status |
 | :--- | :--- | :--- |
-| **Module 1** | **CDC Source Simulation + Incremental Change Feed Foundation** | ✅ **COMPLETED (24/24 Tests)** |
-| **Module 2** | **Delta MERGE + Current-State Tables + Delete Handling** | ✅ **COMPLETED (40/40 Tests)** |
-| **Module 3** | **Late Replay + SCD2 + Schema Evolution** | ⏳ *NOT IMPLEMENTED YET* |
-| **Module 4** | **Auto Loader + Databricks Jobs + CI** | ⏳ *NOT IMPLEMENTED YET* |
+| **Module 1** | **CDC Source Simulation + Incremental Change Feed Foundation** | ✅ **COMPLETED (24 pytest items passing)** |
+| **Module 2** | **Delta MERGE + Current-State Tables + Delete Handling** | ✅ **COMPLETED (18 pytest items passing / 40 requirements covered)** |
+| **Module 3** | **Late Replay + SCD2 History + Schema Evolution** | ✅ **COMPLETED (15 pytest items passing / all requirements verified)** |
+| **Module 4** | **Databricks Auto Loader + Jobs + CI/CD** | ⏳ *NOT IMPLEMENTED YET* |
+
+> **Global Regression Metric**: Exactly **57 pytest items collected and passing** (`pytest --collect-only -q` -> 57 items; `57 passed, 0 failed` in `pytest -v`).
 
 ---
 
@@ -158,5 +187,8 @@ ruff check .
 - [03_EVENT_ORDERING_DEDUP.md](docs/03_EVENT_ORDERING_DEDUP.md): Change ordering, deduplication, and late event strategies.
 - [04_DELTA_CURRENT_STATE.md](docs/04_DELTA_CURRENT_STATE.md): Delta Lake storage layer, schemas, MERGE upsert, and soft-delete tombstones.
 - [05_CDC_MERGE_IDEMPOTENCY.md](docs/05_CDC_MERGE_IDEMPOTENCY.md): Idempotent processing, crash recovery, within-batch collapsing, and atomic checkpoints.
+- [06_LATE_EVENT_REPLAY_SCD2.md](docs/06_LATE_EVENT_REPLAY_SCD2.md): Late-arriving CDC events, arrival vs source order, canonical event store, replay queue, operational SCD2 history, key-scoped timeline rebuild, collision handling, and replay idempotency.
+- [07_SCHEMA_EVOLUTION_RECOVERY.md](docs/07_SCHEMA_EVOLUTION_RECOVERY.md): Versioned payload schemas, controlled Delta schema evolution, why global autoMerge is risky, unknown schema quarantine, backward compatibility, and checkpoint isolation.
 - [IMPLEMENTATION_MAP.md](docs/IMPLEMENTATION_MAP.md): Complete requirements to code trace matrix.
-- [INTERVIEW_QA.md](docs/INTERVIEW_QA.md): 25 production data engineering interview questions & answers.
+- [INTERVIEW_QA.md](docs/INTERVIEW_QA.md): 41 production data engineering interview questions & answers.
+

@@ -160,3 +160,112 @@ When an entity is deleted and later re-created in the OLTP database, a new `INSE
 1. The incoming `INSERT` matches the existing tombstone row on the business key.
 2. The sequence guard condition passes (`insert.source_sequence > tombstone._last_source_sequence`).
 3. The row is updated in-place: `_is_deleted` is flipped back to `false`, lineage fields advance to the new event, and business fields are populated with the new after-image.
+
+---
+
+### Q26: Why shouldn't a late event overwrite the current row?
+**Answer**:
+A late event represents an older, superseded state from the OLTP system (e.g. sequence 135 arriving after sequence 150 has already been applied). If the late event overwrote the current row, the table would regress to an obsolete state, violating the current-state contract (which mandates holding the latest known state) and creating critical business bugs such as reviving churned subscriptions or resetting paid invoices.
+
+---
+
+### Q27: How do you repair SCD2 when a change arrives between two existing versions?
+**Answer**:
+When an event arrives at sequence 135 between existing versions `[120, 150)` and `[150, NULL)`:
+1. The preceding version (`seq 120`) has its `valid_to_sequence` corrected from `150` down to `135`.
+2. A new intermediate version is inserted spanning `[135, 150)` with the late event's attributes and `is_current = false`.
+3. The subsequent version (`seq 150`) remains at `[150, NULL)` with `is_current = true`.
+4. Contiguity is preserved: `120 -> 135 -> 150`.
+
+---
+
+### Q28: Why rebuild one business key instead of manually patching several intervals?
+**Answer**:
+Manually running individual SQL `UPDATE` statements to stitch intervals in a live table is error-prone, risks race conditions, and can easily leave overlapping or gap intervals if an update fails midway. A key-scoped rebuild isolates only the affected business key, loads its baseline and all validated events from the immutable event store, orders them by sequence, computes the complete timeline mathematically, validates all 11 invariants in memory, and performs an atomic overwrite of that key's history rows. It is 100% deterministic, idempotent, and avoids whole-table locks.
+
+---
+
+### Q29: What is the difference between `source_sequence` and `event_timestamp`?
+**Answer**:
+- `source_sequence`: The authoritative linear position in the database WAL/transaction log (e.g. Postgres LSN, MySQL binlog offset). It defines the strict causal ordering of state mutations.
+- `event_timestamp`: The wall-clock time recorded at event creation. Wall-clock timestamps are subject to NTP drift, clock skew across distributed servers, and microsecond collisions, meaning timestamp order does not guarantee causal transaction order.
+
+---
+
+### Q30: What does replay mean?
+**Answer**:
+Replay is the process of reprocessing historical CDC events to reconstruct or correct derived analytical state (such as SCD2 history, aggregations, or downstream projections) after out-of-order deliveries, pipeline bugs, or schema migrations have occurred. It operates as an asynchronous correction lane separate from the real-time forward ingestion stream.
+
+---
+
+### Q31: Why must replay not regress the ingestion checkpoint?
+**Answer**:
+The global ingestion checkpoint tracks forward consumption progress (high-water marks) from the primary CDC source. Replay is a historical correction lane for already-ingested or late events. If replay were to regress the checkpoint to an old sequence number, the forward ingestion engine would re-fetch and re-process hundreds or thousands of already-committed batches, causing massive duplicate processing, performance degradation, and potential data integrity failures.
+
+---
+
+### Q32: How do you detect a source-sequence collision?
+**Answer**:
+A sequence collision occurs when two *different* `event_id` values share the exact same `(source_table, business_key, source_sequence)`. In a valid database transaction log, a single entity cannot undergo two independent mutations at the identical sequence number. The rebuilder groups events by sequence and checks `len(set(event_ids)) > 1`. If detected, it raises `SourceSequenceConflictError`, sets the replay queue item to `CONFLICT`, and halts mutation for that key to avoid guessing.
+
+---
+
+### Q33: Event store vs current-state table vs SCD2 history?
+**Answer**:
+- **Canonical Event Store**: Immutable append/merge log of *all* valid, deduplicated logical CDC mutations in historical order. System of record for replay and auditing.
+- **Current-State Table**: Physical snapshot holding exactly *one* latest row per business key reflecting the highest sequence number seen to date. Optimized for point lookups and operational querying.
+- **Operational SCD2 History**: Chronological, contiguous state version timeline `[valid_from, valid_to)` per key tracking the historical evolution of the entity over time.
+
+---
+
+### Q34: Why keep a canonical event store?
+**Answer**:
+Current-state tables collapse intermediate changes and discard historical payloads. Audit ledgers track metadata but not complete business data. Without a canonical event store holding every valid, uncollapsed payload, historical replay, audit reconstructions, and time-travel backfills would be impossible once raw CDC files are archived or purged from message brokers.
+
+---
+
+### Q35: What happens if history commits but replay audit fails?
+**Answer**:
+This is a cross-table crash gap. History for the key has been reconstructed and committed, but the replay audit table was not updated and the replay queue item remained in `PENDING`. On restart, the replay processor re-executes the rebuild. Because version IDs are deterministic hashes (`SHA256(key + seq + event_id)`), the rebuild produces the exact same versions and overwrites the key's history idempotently without duplicating rows. It then successfully commits the audit record and marks the queue item `APPLIED`.
+
+---
+
+### Q36: How does idempotent replay recover?
+**Answer**:
+1. Uses deterministic history version IDs and replay IDs based on content hashes.
+2. Employs key-scoped replacement (`DELETE WHERE key` + `INSERT` or Delta `MERGE`) so multiple runs yield the identical row count and versions.
+3. Rerunning a batch or replay job is a safe no-op that converges to the correct state without side effects.
+
+---
+
+### Q37: What is controlled schema evolution?
+**Answer**:
+Controlled schema evolution is the practice of updating downstream table structures through explicit, audited migration operations (e.g. dedicated `ALTER TABLE` or scoped `mergeSchema` scripts) with version registries, rather than allowing arbitrary incoming event payloads to dynamically alter table schemas at runtime.
+
+---
+
+### Q38: Why avoid globally enabling `autoMerge`?
+**Answer**:
+Globally setting `spark.databricks.delta.schema.autoMerge.enabled = true` allows any incoming payload defect (such as a misspelled field name like `billing_cycel`, malformed payload structure, or incorrect data type) to permanently alter the schema of production Delta tables without human oversight or governance, leading to silent data corruption and query breakages downstream.
+
+---
+
+### Q39: How do old V1 events work after V2 columns exist?
+**Answer**:
+When target tables and history tables are evolved to V2 (adding columns `billing_cycle` and `currency`), older V1 events are still fully supported:
+1. The schema registry recognizes `schema_version = 1`.
+2. Existing V1 rows in the table retain `NULL` for the new columns.
+3. When a late V1 event is merged or replayed, it updates only the fields known to V1, leaving target V2 columns untouched.
+
+---
+
+### Q40: What happens to fields that did not exist in V1?
+**Answer**:
+Fields that did not exist in V1 (`billing_cycle`, `currency`) remain `NULL` for all V1-era versions in the SCD2 history table. When a V1 forward event is applied to an evolved target table, the MERGE statement's dynamically computed set clause updates only the columns present in both the V1 payload and the target, preserving whatever values already exist in the target V2 columns.
+
+---
+
+### Q41: Why is this SCD2 history not the same as a Kimball dimension?
+**Answer**:
+A Kimball dimension SCD2 is designed for dimensional OLAP data warehousing: it uses surrogate integer keys, date dimension foreign keys, business effective/expiry dates, and flags indicating currentness for star schema reporting. In contrast, this operational SCD2 history is an immutable source-system state timeline indexed by database transaction log positions (`source_sequence`), capturing low-level transactional transitions for engineering auditing, event replay, and exact point-in-time system state reconstruction.
+

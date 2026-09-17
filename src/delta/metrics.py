@@ -6,7 +6,6 @@ from typing import Optional
 
 from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
 
 from src.config.settings import DEFAULT_AUDIT_DIR
 from src.delta.merge import MergeExecutionMetrics

@@ -6,7 +6,7 @@ from typing import Optional, Set
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 
-from src.config.settings import DEFAULT_APPLIED_EVENTS_DIR, DEFAULT_AUDIT_DIR
+from src.config.settings import DEFAULT_AUDIT_DIR
 from src.delta.schemas import APPLIED_EVENTS_SCHEMA
 
 

@@ -6,6 +6,31 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 
+def compute_canonical_event_hash_expr():
+    """Build PySpark expression for SHA-256 canonical hash of envelope fields and payload."""
+    return F.sha2(
+        F.concat_ws(
+            "||",
+            F.coalesce(F.col("event_id"), F.lit("")),
+            F.coalesce(F.col("source_table"), F.lit("")),
+            F.coalesce(F.col("operation"), F.lit("")),
+            F.coalesce(F.col("business_key"), F.lit("")),
+            F.coalesce(F.col("source_sequence").cast("string"), F.lit("")),
+            F.coalesce(F.col("event_timestamp"), F.lit("")),
+            F.coalesce(F.col("ingested_timestamp"), F.lit("")),
+            F.coalesce(F.col("batch_id").cast("string"), F.lit("")),
+            F.coalesce(F.col("schema_version").cast("string"), F.lit("")),
+            F.coalesce(F.col("payload"), F.lit("")),
+        ),
+        256,
+    )
+
+
+def add_canonical_event_hash(df: DataFrame, col_name: str = "canonical_event_hash") -> DataFrame:
+    """Add a deterministic SHA-256 canonical hash of all envelope fields and payload."""
+    return df.withColumn(col_name, compute_canonical_event_hash_expr())
+
+
 def deduplicate_cdc_events(df: DataFrame) -> Tuple[DataFrame, DataFrame]:
     """Deduplicate CDC events deterministically by event_id.
 
@@ -33,24 +58,7 @@ def deduplicate_cdc_events(df: DataFrame) -> Tuple[DataFrame, DataFrame]:
     Returns:
         (deduped_df, duplicates_df)
     """
-    canonical_hash_expr = F.sha2(
-        F.concat_ws(
-            "||",
-            F.coalesce(F.col("event_id"), F.lit("")),
-            F.coalesce(F.col("source_table"), F.lit("")),
-            F.coalesce(F.col("operation"), F.lit("")),
-            F.coalesce(F.col("business_key"), F.lit("")),
-            F.coalesce(F.col("source_sequence").cast("string"), F.lit("")),
-            F.coalesce(F.col("event_timestamp"), F.lit("")),
-            F.coalesce(F.col("ingested_timestamp"), F.lit("")),
-            F.coalesce(F.col("batch_id").cast("string"), F.lit("")),
-            F.coalesce(F.col("schema_version").cast("string"), F.lit("")),
-            F.coalesce(F.col("payload"), F.lit("")),
-        ),
-        256,
-    )
-
-    df_with_hash = df.withColumn("_canonical_event_hash", canonical_hash_expr)
+    df_with_hash = add_canonical_event_hash(df, "_canonical_event_hash")
 
     # Deterministic tie-breaking order:
     # 1. Earliest ingestion timestamp

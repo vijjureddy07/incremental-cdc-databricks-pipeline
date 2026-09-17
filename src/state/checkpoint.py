@@ -110,12 +110,19 @@ class CheckpointManager:
         self.state_file_path = self.checkpoint_dir / self.STATE_FILENAME
 
     def _migrate_legacy_files_if_needed(self) -> Optional[GlobalCheckpointState]:
-        """Auto-migrate legacy per-table JSON files if state_file_path does not exist."""
+        """Auto-migrate legacy per-table JSON files if state_file_path does not exist.
+
+        CRITICAL CONSISTENCY CONTRACT:
+        A batch may only be marked globally completed if it completed for EVERY required source table.
+        Therefore, we compute completed batches as the set INTERSECTION across all required tables.
+        If ANY required table file is missing, completed_batch_ids must be empty (no false global completion),
+        while individual table high-water marks are still migrated.
+        """
         if self.state_file_path.exists():
             return None
 
         migrated_tables: Dict[str, TableState] = {}
-        all_completed_batches: set = set()
+        table_batch_sets: Dict[str, set] = {}
 
         for table in SUPPORTED_TABLES:
             legacy_path = self.checkpoint_dir / f"{table}.json"
@@ -130,15 +137,30 @@ class CheckpointManager:
                             "last_updated_at", datetime.now(timezone.utc).isoformat()
                         ),
                     )
-                    all_completed_batches.update(data.get("processed_batch_ids", []))
+                    table_batch_sets[table] = set(data.get("processed_batch_ids", []))
                 except Exception:
                     pass
 
+        # Only compute intersection if ALL required tables have valid legacy files
+        if len(table_batch_sets) == len(SUPPORTED_TABLES):
+            completed_batches = set.intersection(*table_batch_sets.values())
+        else:
+            completed_batches = set()
+
         if migrated_tables:
+            # Ensure all supported tables exist in migrated state
+            for table in SUPPORTED_TABLES:
+                if table not in migrated_tables:
+                    migrated_tables[table] = TableState(
+                        highest_source_sequence=0,
+                        last_processed_batch_id=0,
+                        last_updated_at=datetime.now(timezone.utc).isoformat(),
+                    )
+
             initial_state = GlobalCheckpointState(
                 version=1,
                 tables=migrated_tables,
-                completed_batch_ids=sorted(all_completed_batches),
+                completed_batch_ids=sorted(completed_batches),
                 last_updated_at=datetime.now(timezone.utc).isoformat(),
             )
             self._save_global_state(initial_state)

@@ -13,6 +13,7 @@ from pyspark.sql.types import (
     StructType,
 )
 
+from src.schema_evolution.registry import is_supported_schema_version
 from src.schemas.cdc_schema import (
     ALLOWED_OPERATIONS,
     ALLOWED_TABLES,
@@ -80,6 +81,12 @@ def validate_event_row(
     # 8. schema_version checks
     if schema_version is None or schema_version <= 0:
         reasons.append(f"INVALID_SCHEMA_VERSION: {schema_version}")
+    elif source_table in ALLOWED_TABLES and not is_supported_schema_version(
+        source_table, schema_version
+    ):
+        reasons.append(
+            f"UNSUPPORTED_SCHEMA_VERSION: table '{source_table}' does not support schema_version {schema_version}"
+        )
 
     # 9. payload validation & primary key consistency (A5)
     if payload is None or len(payload.strip()) == 0:

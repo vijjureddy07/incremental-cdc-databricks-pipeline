@@ -65,11 +65,13 @@ class CDCGenerator:
         scale: str = "tiny",
         seed: int = 42,
         defects: Optional[DefectConfig] = None,
+        schema_transition_batch: Optional[int] = None,
     ):
         self.scale = scale
         self.seed = seed
         self.rng = random.Random(seed)
         self.defects = defects or DefectConfig()
+        self.schema_transition_batch = schema_transition_batch
         self.scale_config: ScaleConfig = SCALE_PROFILES[scale]
 
         # Initialize or inherit state
@@ -145,12 +147,21 @@ class CDCGenerator:
         )
 
         # 2. Subscriptions CDC (Includes legitimate multiple updates to the same key)
+        sub_schema_ver = (
+            2
+            if (
+                self.schema_transition_batch is not None
+                and batch_id >= self.schema_transition_batch
+            )
+            else CURRENT_SCHEMA_VERSION
+        )
         self._generate_subscription_events(
             batch_id,
             batch_time,
             target_subscriptions,
             batch_events_by_table["subscriptions"],
             defects_injected,
+            schema_version=sub_schema_ver,
         )
 
         # 3. Invoices CDC
@@ -185,6 +196,10 @@ class CDCGenerator:
         max_seq = max(valid_seqs) if valid_seqs else 0
 
         table_counts = {t: len(evs) for t, evs in batch_events_by_table.items()}
+        table_schema_versions = {t: CURRENT_SCHEMA_VERSION for t in table_counts}
+        if "subscriptions" in table_schema_versions:
+            table_schema_versions["subscriptions"] = sub_schema_ver
+
         manifest = BatchManifest(
             batch_id=batch_id,
             created_at=batch_time.isoformat(),
@@ -192,7 +207,7 @@ class CDCGenerator:
             maximum_source_sequence=max_seq,
             event_count=len(all_events),
             table_event_counts=table_counts,
-            schema_versions={t: CURRENT_SCHEMA_VERSION for t in table_counts},
+            schema_versions=table_schema_versions,
             defects_injected=defects_injected,
         )
 
@@ -299,6 +314,7 @@ class CDCGenerator:
         count: int,
         out_list: List[Dict[str, Any]],
         defects: List[str],
+        schema_version: int = CURRENT_SCHEMA_VERSION,
     ) -> None:
         # Demonstrate MULTIPLE LEGITIMATE UPDATES TO THE SAME BUSINESS KEY
         # Pick one active subscription to receive 2 distinct sequential updates in this batch
@@ -316,6 +332,9 @@ class CDCGenerator:
                 new_plan = "PRO" if idx == 0 else "ENTERPRISE"
                 sub["plan"] = new_plan
                 sub["monthly_amount"] = 199.0 if idx == 0 else 499.0
+                if schema_version == 2:
+                    sub["billing_cycle"] = "ANNUAL"
+                    sub["currency"] = "USD"
                 ev = CDCEvent.create(
                     source_table="subscriptions",
                     operation=OPERATION_UPDATE,
@@ -324,6 +343,7 @@ class CDCGenerator:
                     event_timestamp=event_time,
                     ingested_timestamp=batch_time.isoformat(),
                     batch_id=batch_id,
+                    schema_version=schema_version,
                     payload_dict=dict(sub),
                 )
                 out_list.append(ev.to_dict())
@@ -348,6 +368,9 @@ class CDCGenerator:
                     "monthly_amount": float(self.rng.choice([49.0, 199.0, 499.0])),
                     "renewal_date": (batch_time + timedelta(days=365)).strftime("%Y-%m-%d"),
                 }
+                if schema_version == 2:
+                    payload["billing_cycle"] = self.rng.choice(["MONTHLY", "ANNUAL"])
+                    payload["currency"] = self.rng.choice(["USD", "EUR", "GBP", "INR"])
                 self.subscriptions_by_id[sub_id] = payload
                 ev = CDCEvent.create(
                     source_table="subscriptions",
@@ -357,6 +380,7 @@ class CDCGenerator:
                     event_timestamp=event_time,
                     ingested_timestamp=batch_time.isoformat(),
                     batch_id=batch_id,
+                    schema_version=schema_version,
                     payload_dict=payload,
                 )
                 out_list.append(ev.to_dict())
@@ -367,6 +391,15 @@ class CDCGenerator:
                 seq = self._next_seq()
                 sub = self.subscriptions_by_id[sub_id]
                 sub["status"] = self.rng.choice(SUBSCRIPTION_STATUSES)
+                if schema_version == 2:
+                    if "billing_cycle" not in sub:
+                        sub["billing_cycle"] = self.rng.choice(["MONTHLY", "ANNUAL"])
+                    if "currency" not in sub:
+                        sub["currency"] = self.rng.choice(["USD", "EUR", "GBP", "INR"])
+                    if self.rng.random() < 0.3:
+                        sub["billing_cycle"] = (
+                            "ANNUAL" if sub.get("billing_cycle") == "MONTHLY" else "MONTHLY"
+                        )
                 ev = CDCEvent.create(
                     source_table="subscriptions",
                     operation=OPERATION_UPDATE,
@@ -375,6 +408,7 @@ class CDCGenerator:
                     event_timestamp=event_time,
                     ingested_timestamp=batch_time.isoformat(),
                     batch_id=batch_id,
+                    schema_version=schema_version,
                     payload_dict=sub,
                 )
                 out_list.append(ev.to_dict())
@@ -395,6 +429,7 @@ class CDCGenerator:
                     event_timestamp=event_time,
                     ingested_timestamp=batch_time.isoformat(),
                     batch_id=batch_id,
+                    schema_version=schema_version,
                     payload_dict=delete_payload,
                 )
                 out_list.append(ev.to_dict())
@@ -654,9 +689,15 @@ def generate_cdc_batches(
     seed: int = 42,
     output_dir: Optional[Path] = None,
     defects: Optional[DefectConfig] = None,
+    schema_transition_batch: Optional[int] = None,
 ) -> List[Tuple[Dict[str, List[Dict[str, Any]]], BatchManifest]]:
     """Convenience function generating sequential batches starting from batch 1."""
-    generator = CDCGenerator(scale=scale, seed=seed, defects=defects)
+    generator = CDCGenerator(
+        scale=scale,
+        seed=seed,
+        defects=defects,
+        schema_transition_batch=schema_transition_batch,
+    )
     results = []
     for b_id in range(1, num_batches + 1):
         batch_data, manifest = generator.generate_batch(batch_id=b_id, output_dir=output_dir)

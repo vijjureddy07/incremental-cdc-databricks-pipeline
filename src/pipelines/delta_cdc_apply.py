@@ -21,7 +21,6 @@ from src.config.settings import (
     SUPPORTED_TABLES,
 )
 from src.delta.audit import (
-    get_recorded_ledger_event_ids,
     upsert_applied_events,
 )
 from src.delta.current_state import (
@@ -111,9 +110,6 @@ class DeltaCDCApplier:
         batch_id = batch.batch_id
         summary = BatchApplySummary(batch_id=batch_id)
 
-        # Existing ledger event IDs for recovery tracking
-        existing_ledger_ids = get_recorded_ledger_event_ids(self.spark, self.audit_dir)
-
         staged_audit_dfs: List[DataFrame] = []
         staged_hwm_updates: Dict[str, int] = {}
         staged_table_metrics: Dict[str, MergeExecutionMetrics] = {}
@@ -164,7 +160,7 @@ class DeltaCDCApplier:
                 parsed_batch_df=parsed_df,
                 batch_id=batch_id,
                 delta_dir=self.delta_dir,
-                existing_ledger_event_ids=existing_ledger_ids,
+                audit_dir=self.audit_dir,
             )
 
             staged_audit_dfs.append(audit_df)

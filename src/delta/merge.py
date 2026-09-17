@@ -3,14 +3,16 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
+from src.delta.audit import get_applied_events_path
 from src.delta.current_state import get_current_table_path
 from src.delta.schemas import (
+    LINEAGE_FIELD_NAMES,
     OUTCOME_ALREADY_APPLIED,
     OUTCOME_APPLIED_DELETE,
     OUTCOME_APPLIED_INSERT,
@@ -18,7 +20,6 @@ from src.delta.schemas import (
     OUTCOME_RECOVERED_AFTER_PARTIAL_COMMIT,
     OUTCOME_STALE_NOOP,
     OUTCOME_SUPERSEDED_WITHIN_BATCH,
-    PAYLOAD_SCHEMAS,
     TARGET_PRIMARY_KEYS,
 )
 
@@ -78,6 +79,7 @@ def classify_events_and_apply_merge(
     parsed_batch_df: DataFrame,
     batch_id: int,
     delta_dir: Optional[Path] = None,
+    audit_dir: Optional[Path] = None,
     existing_ledger_event_ids: Optional[set] = None,
 ) -> Tuple[DataFrame, MergeExecutionMetrics]:
     """Execute Delta MERGE for a source table with tombstone delete handling and conflict guards.
@@ -99,8 +101,6 @@ def classify_events_and_apply_merge(
     """
     table_path = get_current_table_path(source_table, delta_dir)
     pk_col = TARGET_PRIMARY_KEYS[source_table]
-    business_schema = PAYLOAD_SCHEMAS[source_table]
-    business_col_names = [f.name for f in business_schema.fields]
     proc_time = datetime.now(timezone.utc).isoformat()
 
     # Step 1: Separate winning candidate mutations from superseded in-batch changes
@@ -110,62 +110,63 @@ def classify_events_and_apply_merge(
     superseded_count = superseded_df.count()
     candidate_count = candidate_winners_df.count()
 
-    # Step 2: Extract pre-merge target state for batch candidates to freeze classification
+    # Step 2: Distributed pre-merge target projection (NO DRIVER COLLECTION)
     target_df = spark.read.format("delta").load(str(table_path))
-    candidate_pks = [r[pk_col] for r in candidate_winners_df.select(pk_col).collect()]
+    target_cols = set(target_df.columns)
 
-    if candidate_pks:
-        tgt_matches = (
-            target_df.filter(F.col(pk_col).isin(candidate_pks))
-            .select(
-                F.col(pk_col).alias("_tgt_pk"),
-                F.col("_last_source_sequence").alias("_tgt_seq"),
-                F.col("_last_event_id").alias("_tgt_event_id"),
-                F.col("_is_deleted").alias("_tgt_is_deleted"),
-            )
-            .collect()
+    target_proj_fields = [
+        F.col(pk_col).alias("_tgt_pk"),
+        F.col("_last_source_sequence").alias("_tgt_seq"),
+        F.col("_last_event_id").alias("_tgt_event_id"),
+        F.col("_is_deleted").alias("_tgt_is_deleted"),
+    ]
+    if "_last_schema_version" in target_cols:
+        target_proj_fields.append(F.col("_last_schema_version").alias("_tgt_schema_version"))
+
+    target_projection = target_df.select(*target_proj_fields)
+
+    # Distributed applied events ledger projection (NO DRIVER COLLECTION)
+    ledger_path = get_applied_events_path(audit_dir)
+    if ledger_path.exists() and DeltaTable.isDeltaTable(spark, str(ledger_path)):
+        ledger_projection = (
+            spark.read.format("delta")
+            .load(str(ledger_path))
+            .select(F.col("event_id").alias("_ledger_event_id"))
         )
     else:
-        tgt_matches = []
+        from pyspark.sql.types import StringType, StructField, StructType
 
-    from pyspark.sql.types import BooleanType, LongType, StringType, StructField, StructType
+        ledger_projection = spark.createDataFrame(
+            [], StructType([StructField("_ledger_event_id", StringType(), True)])
+        )
 
-    target_subset_schema = StructType([
-        StructField("_tgt_pk", StringType(), True),
-        StructField("_tgt_seq", LongType(), True),
-        StructField("_tgt_event_id", StringType(), True),
-        StructField("_tgt_is_deleted", BooleanType(), True),
-    ])
-
-    rows_data = [
-        (r["_tgt_pk"], r["_tgt_seq"], r["_tgt_event_id"], r["_tgt_is_deleted"])
-        for r in tgt_matches
-    ]
-    target_subset = spark.createDataFrame(rows_data, target_subset_schema)
-
+    # Perform distributed joins
     joined_candidates = candidate_winners_df.join(
-        target_subset,
-        candidate_winners_df[pk_col] == target_subset["_tgt_pk"],
+        target_projection, candidate_winners_df[pk_col] == target_projection["_tgt_pk"], "left"
+    ).join(
+        ledger_projection,
+        candidate_winners_df["event_id"] == ledger_projection["_ledger_event_id"],
         "left",
     )
 
-    ledger_ids = existing_ledger_event_ids or set()
-
     # Define outcome classification expression
-    # Handle crash recovery: if target already has this event and sequence, but ledger missed it
     is_partially_committed_expr = (
         (F.col("_tgt_pk").isNotNull())
         & (F.col("event_id") == F.col("_tgt_event_id"))
         & (F.col("source_sequence") == F.col("_tgt_seq"))
     )
 
-    is_already_applied_expr = is_partially_committed_expr & (
-        F.col("event_id").isin(list(ledger_ids)) if ledger_ids else F.lit(False)
-    )
+    if existing_ledger_event_ids is not None:
+        is_in_ledger = (
+            F.col("event_id").isin(list(existing_ledger_event_ids))
+            if existing_ledger_event_ids
+            else F.lit(False)
+        )
+    else:
+        is_in_ledger = F.col("_ledger_event_id").isNotNull()
 
-    is_recovered_expr = is_partially_committed_expr & (
-        ~F.col("event_id").isin(list(ledger_ids)) if ledger_ids else F.lit(True)
-    )
+    is_already_applied_expr = is_partially_committed_expr & is_in_ledger
+    is_recovered_expr = is_partially_committed_expr & (~is_in_ledger)
 
     outcome_expr = (
         F.when(is_already_applied_expr, F.lit(OUTCOME_ALREADY_APPLIED))
@@ -187,17 +188,21 @@ def classify_events_and_apply_merge(
         .withColumn(
             "target_sequence_after",
             F.when(
-                F.col("apply_outcome").isin([
-                    OUTCOME_APPLIED_INSERT,
-                    OUTCOME_APPLIED_UPDATE,
-                    OUTCOME_APPLIED_DELETE,
-                ]),
+                F.col("apply_outcome").isin(
+                    [
+                        OUTCOME_APPLIED_INSERT,
+                        OUTCOME_APPLIED_UPDATE,
+                        OUTCOME_APPLIED_DELETE,
+                    ]
+                ),
                 F.col("source_sequence"),
             ).otherwise(F.col("_tgt_seq")),
         )
         .withColumn(
             "reason",
-            F.when(F.col("apply_outcome") == OUTCOME_STALE_NOOP, F.lit("SOURCE_SEQUENCE_LEQ_TARGET"))
+            F.when(
+                F.col("apply_outcome") == OUTCOME_STALE_NOOP, F.lit("SOURCE_SEQUENCE_LEQ_TARGET")
+            )
             .when(
                 F.col("apply_outcome") == OUTCOME_RECOVERED_AFTER_PARTIAL_COMMIT,
                 F.lit("RECOVERED_AFTER_UNRECORDED_TARGET_COMMIT"),
@@ -208,7 +213,7 @@ def classify_events_and_apply_merge(
             )
             .otherwise(F.lit(None)),
         )
-    )
+    ).localCheckpoint(eager=True)
 
     # Step 3: Build audit records for superseded events
     classified_superseded = (
@@ -245,11 +250,7 @@ def classify_events_and_apply_merge(
     )
 
     # Calculate metrics
-    outcome_counts = (
-        all_audit_df.groupBy("apply_outcome")
-        .count()
-        .collect()
-    )
+    outcome_counts = all_audit_df.groupBy("apply_outcome").count().collect()
     counts_map = {row["apply_outcome"]: row["count"] for row in outcome_counts}
 
     applied_inserts = counts_map.get(OUTCOME_APPLIED_INSERT, 0)
@@ -273,28 +274,40 @@ def classify_events_and_apply_merge(
     )
 
     # Step 4: Execute Delta MERGE on Current-State Table
-    # Filter candidates to only those that genuinely mutate state
     mutating_candidates_df = classified_candidates.filter(
-        F.col("apply_outcome").isin([
-            OUTCOME_APPLIED_INSERT,
-            OUTCOME_APPLIED_UPDATE,
-            OUTCOME_APPLIED_DELETE,
-        ])
+        F.col("apply_outcome").isin(
+            [
+                OUTCOME_APPLIED_INSERT,
+                OUTCOME_APPLIED_UPDATE,
+                OUTCOME_APPLIED_DELETE,
+            ]
+        )
     )
 
     if mutating_candidates_df.count() > 0:
         delta_table = DeltaTable.forPath(spark, str(table_path))
+        source_cols = set(mutating_candidates_df.columns)
+
+        # Available business columns in source that target also contains
+        available_business_cols = [
+            c
+            for c in target_cols
+            if c in source_cols and c not in LINEAGE_FIELD_NAMES and c != pk_col
+        ]
 
         # Setup Update dictionary for INSERT / UPDATE
-        update_set: Dict[str, str] = {c: f"source.{c}" for c in business_col_names}
-        update_set.update({
-            "_last_source_sequence": "source.source_sequence",
-            "_last_event_id": "source.event_id",
-            "_last_event_timestamp": "source.event_timestamp",
-            "_last_batch_id": f"cast({batch_id} as long)",
-            "_updated_at": f"'{proc_time}'",
-            "_is_deleted": "false",
-        })
+        update_set: Dict[str, str] = {c: f"source.{c}" for c in available_business_cols}
+        update_set.update(
+            {
+                "_last_source_sequence": "source.source_sequence",
+                "_last_event_id": "source.event_id",
+                "_last_event_timestamp": "source.event_timestamp",
+                "_last_batch_id": f"cast({batch_id} as long)",
+                "_updated_at": f"'{proc_time}'",
+                "_is_deleted": "false",
+                "_last_schema_version": "cast(source.schema_version as int)",
+            }
+        )
 
         # Setup Delete tombstone dictionary (preserves existing target business attributes)
         delete_tombstone_set: Dict[str, str] = {
@@ -304,32 +317,41 @@ def classify_events_and_apply_merge(
             "_last_batch_id": f"cast({batch_id} as long)",
             "_updated_at": f"'{proc_time}'",
             "_is_deleted": "true",
+            "_last_schema_version": "cast(source.schema_version as int)",
         }
 
         # Setup Insert dictionary for new active records
-        insert_set: Dict[str, str] = {c: f"source.{c}" for c in business_col_names}
-        insert_set.update({
-            "_last_source_sequence": "source.source_sequence",
-            "_last_event_id": "source.event_id",
-            "_last_event_timestamp": "source.event_timestamp",
-            "_last_batch_id": f"cast({batch_id} as long)",
-            "_updated_at": f"'{proc_time}'",
-            "_is_deleted": "false",
-        })
+        insert_set: Dict[str, str] = {pk_col: f"source.{pk_col}"}
+        for c in available_business_cols:
+            insert_set[c] = f"source.{c}"
+        insert_set.update(
+            {
+                "_last_source_sequence": "source.source_sequence",
+                "_last_event_id": "source.event_id",
+                "_last_event_timestamp": "source.event_timestamp",
+                "_last_batch_id": f"cast({batch_id} as long)",
+                "_updated_at": f"'{proc_time}'",
+                "_is_deleted": "false",
+                "_last_schema_version": "cast(source.schema_version as int)",
+            }
+        )
 
         # Setup Protective Tombstone dictionary for unknown keys deleted before creation
         protective_tombstone_set: Dict[str, str] = {pk_col: f"source.{pk_col}"}
-        for col in business_col_names:
-            if col != pk_col:
+        for col in target_cols:
+            if col != pk_col and col not in LINEAGE_FIELD_NAMES:
                 protective_tombstone_set[col] = "null"
-        protective_tombstone_set.update({
-            "_last_source_sequence": "source.source_sequence",
-            "_last_event_id": "source.event_id",
-            "_last_event_timestamp": "source.event_timestamp",
-            "_last_batch_id": f"cast({batch_id} as long)",
-            "_updated_at": f"'{proc_time}'",
-            "_is_deleted": "true",
-        })
+        protective_tombstone_set.update(
+            {
+                "_last_source_sequence": "source.source_sequence",
+                "_last_event_id": "source.event_id",
+                "_last_event_timestamp": "source.event_timestamp",
+                "_last_batch_id": f"cast({batch_id} as long)",
+                "_updated_at": f"'{proc_time}'",
+                "_is_deleted": "true",
+                "_last_schema_version": "cast(source.schema_version as int)",
+            }
+        )
 
         merge_condition = f"target.{pk_col} = source.{pk_col}"
 

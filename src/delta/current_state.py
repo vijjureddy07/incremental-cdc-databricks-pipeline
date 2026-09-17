@@ -9,6 +9,7 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DecimalType,
+    IntegerType,
     LongType,
     StringType,
     StructField,
@@ -28,6 +29,12 @@ from src.delta.schemas import (
 SNAPSHOT_SENTINEL_EVENT_ID = "SNAPSHOT_INIT"
 
 
+class DeltaStateError(RuntimeError):
+    """Raised when an existing directory is corrupt, unreadable, or not a valid Delta table."""
+
+    pass
+
+
 def get_current_table_path(table_name: str, base_dir: Optional[Path] = None) -> Path:
     """Return local filesystem path for a Delta current-state table."""
     current_dir = base_dir or DEFAULT_CURRENT_DIR
@@ -35,13 +42,30 @@ def get_current_table_path(table_name: str, base_dir: Optional[Path] = None) -> 
 
 
 def is_delta_table_initialized(spark: SparkSession, table_path: Path) -> bool:
-    """Check whether a Delta table has already been initialized at the path."""
+    """Check whether a Delta table has already been initialized at the path.
+
+    FAIL-LOUD CONTRACT:
+    - Path does not exist -> return False (needs initialization).
+    - Path exists and is a valid Delta table -> return True (already initialized).
+    - Path exists but Delta inspection fails / is not a valid Delta table -> raise DeltaStateError.
+    """
     if not table_path.exists():
         return False
+
     try:
-        return DeltaTable.isDeltaTable(spark, str(table_path))
-    except Exception:
-        return False
+        is_delta = DeltaTable.isDeltaTable(spark, str(table_path))
+    except Exception as exc:
+        raise DeltaStateError(
+            f"Corrupt or unreadable Delta state encountered at '{table_path}': {exc}"
+        ) from exc
+
+    if not is_delta:
+        raise DeltaStateError(
+            f"Path exists at '{table_path}' but is not a valid Delta table. "
+            "Refusing to overwrite unexpected existing state without explicit force_overwrite=True."
+        )
+
+    return True
 
 
 def initialize_delta_current_state(
@@ -55,7 +79,7 @@ def initialize_delta_current_state(
     For each entity (accounts, subscriptions, invoices, payments):
     1. Reads snapshot JSONL files.
     2. Enforces explicit target schema with Decimal monetary fields.
-    3. Adds audit lineage fields (_last_source_sequence, _last_event_id, _is_deleted=false).
+    3. Adds audit lineage fields (_last_source_sequence, _last_event_id, _is_deleted=false, _last_schema_version=1).
     4. Writes initial Delta table to disk.
 
     Returns:
@@ -71,10 +95,11 @@ def initialize_delta_current_state(
     for table in sorted(SUPPORTED_TABLES):
         table_delta_path = get_current_table_path(table, dest_dir)
 
-        if is_delta_table_initialized(spark, table_delta_path) and not force_overwrite:
-            existing_count = spark.read.format("delta").load(str(table_delta_path)).count()
-            counts[table] = existing_count
-            continue
+        if not force_overwrite:
+            if is_delta_table_initialized(spark, table_delta_path):
+                existing_count = spark.read.format("delta").load(str(table_delta_path)).count()
+                counts[table] = existing_count
+                continue
 
         file_path = snap_path / f"{table}.jsonl"
         if not file_path.exists():
@@ -111,6 +136,8 @@ def initialize_delta_current_state(
                 projected_cols.append(F.lit(init_time).alias(name))
             elif name == "_is_deleted":
                 projected_cols.append(F.lit(False).alias(name))
+            elif name == "_last_schema_version":
+                projected_cols.append(F.lit(1).cast(IntegerType()).alias(name))
             elif isinstance(field.dataType, DecimalType):
                 # Ensure monetary values are exact DecimalType(12, 2)
                 projected_cols.append(F.col(name).cast(DecimalType(12, 2)).alias(name))
